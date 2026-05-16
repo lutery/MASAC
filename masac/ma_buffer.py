@@ -32,11 +32,11 @@ class MAReplayBuffer:
         """Initialize the replay buffer.
 
         Args:
-            global_obs_shape: Shape of the global observations
-            local_obs_shape: Shape of the locals observations
-            action_dim: Dimension of the actions
-            num_agents: Number of agents
-            max_size: Maximum size of the buffer
+            global_obs_shape: Shape of the global observations 全局所有智能体env的观察空间的shape
+            local_obs_shape: Shape of the locals observations 单个智能体env的观察空间的shape
+            action_dim: Dimension of the actions 单个环境智能体env动作的维度
+            num_agents: Number of agents 有多少个智能体
+            max_size: Maximum size of the buffer 最大的缓存尺寸
             obs_dtype: Data type of the observations
             action_dtype: Data type of the actions
         """
@@ -44,13 +44,16 @@ class MAReplayBuffer:
         self.ptr, self.size = 0, 0
         self.obs_type = obs_dtype
         self.action_type = action_dtype
+        # 看来分别存储全局和每个智能体env局部的观察
         self.global_obs = np.zeros((max_size,) + global_obs_shape, dtype=obs_dtype)
         self.local_obs = np.zeros((max_size, num_agents) + local_obs_shape, dtype=obs_dtype)
         self.next_global_obs = np.zeros((max_size,) + global_obs_shape, dtype=obs_dtype)
         self.next_local_obs = np.zeros((max_size, num_agents) + local_obs_shape, dtype=obs_dtype)
+        # 存储每个智能体的每一步执行的动作
         self.joint_actions = np.zeros(
             (max_size, num_agents * action_dim), dtype=action_dtype
         )  # joint actions are flattened into a single vector
+        # todo 这里每一步进存储一个奖励反馈和是否中断
         self.rewards = np.zeros((max_size,), dtype=np.float32)
         self.terminateds = np.zeros((max_size, 1), dtype=np.float32)
 
@@ -85,7 +88,7 @@ class MAReplayBuffer:
         self.rewards[self.ptr] = np.array(reward, dtype=np.float32).copy()
         self.terminateds[self.ptr] = np.array(terminated).copy()
         self.ptr = (self.ptr + 1) % self.max_size
-        self.size = min(self.size + 1, self.max_size)
+        self.size = min(self.size + 1, self.max_size) # 更新缓冲区的尺寸
 
     def sample(self, batch_size, replace=True, use_cer=False, to_tensor=False, add_id_to_local_obs=False, device=None):
         """Sample a batch of experiences from the buffer.
@@ -93,9 +96,9 @@ class MAReplayBuffer:
         Args:
             batch_size: Batch size
             replace: Whether to sample with replacement
-            use_cer: Whether to use CER
+            use_cer: Whether to use CER 是否使用CER（Combined Experience Replay）策略，即总是使用最新的经验
             to_tensor: Whether to convert the data to PyTorch tensors
-            add_id_to_local_obs: Whether to add the agent id to the local observations
+            add_id_to_local_obs: Whether to add the agent id to the local observations 
             device: Device to use
 
         Returns:
@@ -112,11 +115,13 @@ class MAReplayBuffer:
                 terminateds: Whether the episode is terminated or not (batch_size, 1)
 
         """
-        inds = np.random.choice(self.size, batch_size, replace=replace)
+        inds = np.random.choice(self.size, batch_size, replace=replace) # 采样得到索引
         if use_cer:
-            inds[0] = self.ptr - 1  # always use last experience
+            inds[0] = self.ptr - 1  # always use last experience 提取最新的经验
 
         def flatten_local_obss(local_obs, inds):
+            # 根据inds从 local_obs提取对应的观察
+            # 然后根据不同的配置，将观察组合
             batch_local_obs = []
             for local_obs_ind in local_obs[inds]:
                 local_obs_index = []
