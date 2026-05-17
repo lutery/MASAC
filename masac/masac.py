@@ -230,6 +230,7 @@ if __name__ == "__main__":
 
     # Automatic entropy tuning 这里应该是确认熵的权重是按照训练的来还是固定值
     if args.autotune:
+        # todo 这里存在一个瑕疵，这里的目标熵是单智能体的熵，但是在计算的时候是把所有智能体的动作的log概率加起来作为联合动作的log概率，所以这里的目标熵应该是单智能体熵的智能体数量倍才对
         target_entropy = -torch.prod(torch.Tensor(single_action_space.shape).to(device)).item() # 这里计算最佳的熵，定理，最佳的熵就是这么计算的
         log_alpha = torch.zeros(1, requires_grad=True, device=device) # 创建熵权重log值，这里同样是为了防止熵变成负数
         alpha = log_alpha.exp().item()
@@ -311,81 +312,84 @@ if __name__ == "__main__":
                 next_state_actions, next_state_log_pi, _ = actor.get_action(flattened_next_local_obs)
                 next_joint_actions = next_state_actions.reshape(
                     (args.batch_size, np.prod(single_action_space.shape) * env.unwrapped.max_num_agents)
-                )
+                )# 这里又将动作重新展平为每个env的动作维度 * 智能体数量的形式，准备输入到Q网络中，看起来Q网络就是根据全局obs+所有智能体的动作来预测全局的Q值的
                 # Sums the log probs of the actions in the agent dimension to get the joint log prob
                 next_state_log_pi = einops.reduce(
                     next_state_log_pi.reshape((args.batch_size, env.unwrapped.max_num_agents)), "b a -> b ()", "sum"
-                )
+                ) # 把每个智能体独立的 log 概率加起来，得到联合动作的 log 概率，参与后面的 SAC 的 Bellman 方程中目标 Q 值需要减去熵奖励项
 
-                # SAC Bellman equation
-                qf1_next_target = qf1_target(data.next_global_obs, next_joint_actions)
-                qf2_next_target = qf2_target(data.next_global_obs, next_joint_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                # SAC Bellman equation 
+                qf1_next_target = qf1_target(data.next_global_obs, next_joint_actions) # 预测下一个状态的Q值，全局Q值，所以维度是1
+                qf2_next_target = qf2_target(data.next_global_obs, next_joint_actions) # 预测下一个状态的Q值，全局Q值，所以维度是1
+                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi # 为什么要减去可以看md文档
                 next_q_value = data.rewards.flatten() + (1 - data.terminateds.flatten()) * args.gamma * (
                     min_qf_next_target
                 ).view(-1)
 
-            # Computes q loss
+            # Computes q loss 计算当前动作的Q值，并与目标Q值计算MSE损失
             qf1_a_values = qf1(data.global_obs, data.joint_actions).view(-1)
             qf2_a_values = qf2(data.global_obs, data.joint_actions).view(-1)
             qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
             qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
             qf_loss = qf1_loss + qf2_loss
 
+            # 训练Q值网络，这里的Q值网络是全局OBS的Q值
+            # 看起来局部Q值仅用在预测智能体执行的动作
             q_optimizer.zero_grad()
             qf_loss.backward()
             q_optimizer.step()
 
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
+            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support 每隔一定的间隔才训练一次动作策略网络，来补偿策略更新的延迟
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
                     # flatten data.local_obs to forward for all agents at once
                     flattened_local_obs = data.local_obs.reshape(
                         (args.batch_size * env.unwrapped.max_num_agents, np.prod(single_observation_space.shape) + 1)
-                    )
+                    ) # 展平并行env的obs，方便后续的动作预测
                     # forward pass to get next actions and log probs
                     pi, log_pi, _ = actor.get_action(flattened_local_obs)
                     next_joint_actions = pi.reshape(
                         (args.batch_size, np.prod(single_action_space.shape) * env.unwrapped.max_num_agents)
-                    )
+                    ) # 将预测的动作重新展平为每个env的动作维度 * 智能体数量的形式，准备输入到Q网络中，看起来Q网络就是根据全局obs+所有智能体的动作来预测全局的Q值的
                     # Sums the log probs of the actions in the agent dimension to get the joint log prob
                     # TODO check if this is correct
                     log_pi = einops.reduce(
                         log_pi.reshape((args.batch_size, env.unwrapped.max_num_agents)), "b a -> b ()", "sum"
-                    )
+                    ) # 把每个智能体独立的 log 概率加起来，得到联合动作的 log 概率，参与后面的 SAC 的 Bellman 方程中目标 Q 值需要减去熵奖励项
 
                     # SAC pi update
-                    qf1_pi = qf1(data.global_obs, next_joint_actions)
-                    qf2_pi = qf2(data.global_obs, next_joint_actions)
+                    qf1_pi = qf1(data.global_obs, next_joint_actions) # 全局obs+所有智能体的动作来预测全局的Q值的
+                    qf2_pi = qf2(data.global_obs, next_joint_actions) # 全局obs+所有智能体的动作来预测全局的Q值的
                     min_qf_pi = torch.min(qf1_pi, qf2_pi).view(-1)
-                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
+                    actor_loss = ((alpha * log_pi) - min_qf_pi).mean() # 得到当前状态下预测的Q值，和之前一样减去熵奖励项，得到动作策略的损失函数（但是由于是最大化Q值所以这里用了负号）
+                    # 而 (alpha * log_pi) 依旧是熵奖励项，鼓励策略保持足够的随机性，避免过早收敛到次优策略
 
                     actor_optimizer.zero_grad()
                     actor_loss.backward()
                     actor_optimizer.step()
 
-                    if args.autotune:
+                    if args.autotune: # 自动调整熵权重，对于这条线是通过
                         with torch.no_grad():
-                            _, log_pi, _ = actor.get_action(flattened_local_obs)
+                            _, log_pi, _ = actor.get_action(flattened_local_obs) # 根据当前状态预测动作概率的log值
                             log_pi = einops.reduce(
                                 log_pi.reshape((args.batch_size, env.unwrapped.max_num_agents)), "b a -> b ()", "sum"
-                            )
-                        alpha_loss = (-log_alpha * (log_pi + target_entropy)).mean()
+                            )# 将每个智能体独立的 log 概率加起来，得到联合动作的 log 概率，参与后面的 SAC 的 Bellman 方程中目标 Q 值需要减去熵奖励项
+                        alpha_loss = (-log_alpha * (log_pi + target_entropy)).mean() # 具体的数学推论和直观推论看md文档
 
                         a_optimizer.zero_grad()
                         alpha_loss.backward()
                         a_optimizer.step()
                         alpha = log_alpha.exp().item()
 
-            # update the target networks
+            # update the target networks 同步权重到目标网络
             if global_step % args.target_network_frequency == 0:
                 for param, target_param in zip(qf1.parameters(), qf1_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % 100 == 0:
+            if global_step % 100 == 0: # 记录各种训练记录
                 writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
                 writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
@@ -398,7 +402,9 @@ if __name__ == "__main__":
                 if args.autotune:
                     writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 
-        if terminated or truncated:
+        # 因为是并行环境，所以只要有一个智能体的episode结束了，就重置环境
+        # 这里是简化了处理，不用考虑哪个智能体结束了，对训练数据的进行重新调整
+        if terminated or truncated: # 如果有任何一个智能体的episode结束了，就重置环境
             obs, info = env.reset()
             writer.add_scalar("charts/return", global_return, global_step)
             global_return = 0.0
